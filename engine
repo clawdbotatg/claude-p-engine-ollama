@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""engine — local Ollama as a chat engine (claude-p-agent protocol v0).
+
+One JSON request on stdin, JSONL on stdout, last line
+{"type":"result","text",...,"state":...}. See PLAN-ENGINES.md in the brain repo.
+
+This is a CHAT engine: no tools, no files, no cwd. It talks to a local
+Ollama server's OpenAI-compatible route — nothing leaves the machine, no
+API key, no metered spend. The point is running the agent's persona on
+small local models (testing how dumb a brain can be and still behave).
+
+Env (from the brain's .env; everything has a local default except MODEL):
+  OLLAMA_ENGINE_MODEL     REQUIRED — e.g. llama3.2:3b (`ollama list` to see)
+  OLLAMA_ENGINE_BASE_URL  default http://localhost:11434/v1
+  OLLAMA_ENGINE_HISTORY   max stored messages per conversation key (default 40)
+  OLLAMA_ENGINE_TIMEOUT   HTTP timeout seconds (default 300 — a cold model
+                          load into RAM can take minutes for big weights)
+
+State blob: {"v":0,"messages":[...]} — the conversation history. The system
+prompt (persona + channel policy) is NOT stored; it's prepended fresh every
+turn so persona edits apply immediately. Reasoning models that leak
+<think>...</think> into content get it stripped from the reply (and from
+stored history), but the full raw text is emitted as a "thinking" event.
+"""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+
+def die(msg, code=1):
+    print(f"engine-ollama: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _installed_models(base):
+    """Best-effort `ollama list` via the native API, for a helpful error."""
+    root = re.sub(r"/v1/?$", "", base.rstrip("/"))
+    try:
+        with urllib.request.urlopen(root + "/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m.get("name") for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def main():
+    try:
+        req = json.load(sys.stdin)
+    except ValueError as e:
+        die(f"bad request json: {e}")
+
+    base = (os.environ.get("OLLAMA_ENGINE_BASE_URL")
+            or "http://localhost:11434/v1").strip()
+    model = (os.environ.get("OLLAMA_ENGINE_MODEL") or "").strip()
+    if not model:
+        names = _installed_models(base)
+        die("OLLAMA_ENGINE_MODEL must be set"
+            + (f" — installed: {', '.join(names)}" if names
+               else " (and no Ollama server answered at " + base + ")"))
+    url = base.rstrip("/") + "/chat/completions"
+
+    history = []
+    state = req.get("state")
+    if isinstance(state, dict) and isinstance(state.get("messages"), list):
+        history = [m for m in state["messages"]
+                   if isinstance(m, dict) and m.get("role") and m.get("content")]
+
+    system = (req.get("system") or "").strip()
+    messages = ([{"role": "system", "content": system}] if system else []) \
+        + history + [{"role": "user", "content": req.get("text") or ""}]
+
+    body = json.dumps({"model": model, "messages": messages,
+                       "stream": False}).encode("utf-8")
+    timeout = float(os.environ.get("OLLAMA_ENGINE_TIMEOUT", "300"))
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}),
+            timeout=timeout,
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        if e.code == 404 and "not found" in detail.lower():
+            names = _installed_models(base)
+            detail += f" — installed: {', '.join(names)}" if names else ""
+        die(f"HTTP {e.code} from {url}: {detail}")
+    except Exception as e:
+        die(f"request failed: {e} — is Ollama running? (`ollama serve`, "
+            f"or just `ollama run {model}` once)")
+
+    try:
+        raw = (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        die(f"unexpected response shape: {json.dumps(data)[:500]}")
+
+    # Reasoning models (qwen3*, deepseek-r1*) leak <think>…</think> into content.
+    text = re.sub(r"^\s*<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+    if text != raw:
+        print(json.dumps({"type": "thinking", "text": raw}))
+    if not text:
+        die("empty completion (model produced only thinking?)")
+
+    cap = int(os.environ.get("OLLAMA_ENGINE_HISTORY", "40"))
+    new_history = (history + [
+        {"role": "user", "content": req.get("text") or ""},
+        {"role": "assistant", "content": text},
+    ])[-cap:]
+
+    usage = data.get("usage") or {}
+    if usage:
+        print(json.dumps({"type": "usage", "model": model, **{
+            k: usage[k] for k in ("prompt_tokens", "completion_tokens") if k in usage}}))
+    print(json.dumps({"type": "result", "text": text,
+                      "state": {"v": 0, "messages": new_history}}))
+
+
+if __name__ == "__main__":
+    main()
