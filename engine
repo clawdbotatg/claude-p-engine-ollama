@@ -165,7 +165,8 @@ def main():
         + history + [{"role": "user", "content": req.get("text") or ""}]
 
     raw = ""
-    for i in range(max_tool_turns + 1):
+    nudged = False
+    for i in range(max_tool_turns + 2):
         # last lap: withhold the tool so the model must answer in text
         offer = BASH_TOOL if (tools_mode and i < max_tool_turns) else None
         msg, usage = _chat(url, model, messages, offer, timeout, base)
@@ -176,6 +177,15 @@ def main():
         calls = msg.get("tool_calls") or []
         if not calls:
             raw = (msg.get("content") or "").strip()
+            # reasoning models sometimes emit ONLY <think>…</think> — one nudge
+            if not re.sub(r"^\s*<think>.*?</think>\s*", "", raw,
+                          flags=re.DOTALL).strip() and not nudged:
+                nudged = True
+                messages.append({"role": "assistant", "content": raw or "…"})
+                messages.append({"role": "user",
+                                 "content": "Answer now in plain text (no "
+                                            "thinking tags, no tool calls)."})
+                continue
             break
         messages.append(msg)
         for call in calls:
