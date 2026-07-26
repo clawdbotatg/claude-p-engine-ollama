@@ -149,6 +149,10 @@ def main():
     url = base.rstrip("/") + "/chat/completions"
     timeout = float(os.environ.get("OLLAMA_ENGINE_TIMEOUT", "300"))
 
+    # self-awareness: anything we spawn (tools mode) can see which model is
+    # actually thinking — tools/vitals reads this instead of guessing
+    os.environ["CLAUDE_P_ENGINE_MODEL"] = model
+
     tools_mode = os.environ.get("OLLAMA_ENGINE_TOOLS", "").strip() == "bash"
     max_tool_turns = int(os.environ.get("OLLAMA_ENGINE_MAX_TOOL_TURNS", "8"))
     tool_timeout = float(os.environ.get("OLLAMA_ENGINE_TOOL_TIMEOUT", "60"))

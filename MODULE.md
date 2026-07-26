@@ -26,6 +26,16 @@ loop on a local model — which is the experiment: what's the smallest model
 that actually works? Tool traffic is per-turn scaffolding, never persisted
 to state.
 
+**Measured floor (2026-07-26, three-probe battery: run tools/vitals
+verbatim / create a file, externally verified / read modules.lock):**
+`qwen3:4b` (2.6 GB) is the smallest model that passed all three;
+`qwen3:8b`/`14b`/`qwen3.5:35b-a3b` pass with increasing polish.
+`llama3.2:3b` half-works (real tool calls sometimes, leaked call-JSON
+other times); `qwen3:1.7b` fabricates everything. Tool-calling training
+matters more than raw size. The engine also exports
+`CLAUDE_P_ENGINE_MODEL` so `tools/vitals` run inside a turn reports the
+real local model instead of a stale claude transcript.
+
 ## What it needs
 
 - A local [Ollama](https://ollama.com) (`brew install ollama`) with at least
