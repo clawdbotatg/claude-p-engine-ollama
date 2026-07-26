@@ -1,38 +1,59 @@
 #!/usr/bin/env python3
-"""engine — local Ollama as a chat engine (claude-p-agent protocol v0).
+"""engine — local Ollama as an engine (claude-p-agent protocol v0).
 
 One JSON request on stdin, JSONL on stdout, last line
 {"type":"result","text",...,"state":...}. See PLAN-ENGINES.md in the brain repo.
 
-This is a CHAT engine: no tools, no files, no cwd. It talks to a local
-Ollama server's OpenAI-compatible route — nothing leaves the machine, no
-API key, no metered spend. The point is running the agent's persona on
-small local models (testing how dumb a brain can be and still behave).
+Talks to a local Ollama server's OpenAI-compatible route — nothing leaves
+the machine, no API key, no metered spend. The point is running the agent's
+persona on small local models (testing how dumb a brain can be and still
+behave).
+
+Two modes:
+  chat (default)               no tools, no files, no cwd — pure text.
+  tools (OLLAMA_ENGINE_TOOLS=bash)
+                               the model gets ONE tool: run a shell command
+                               in the agent dir. That's a real agent loop on
+                               a local model — and a real shell in the hands
+                               of whatever model you picked. Supervised
+                               experiments only; see MODULE.md. Note the
+                               brain's guard hook does NOT run here (Claude
+                               Code hooks are claude-engine-only).
 
 Env (from the brain's .env; everything has a local default except MODEL):
-  OLLAMA_ENGINE_MODEL     REQUIRED — e.g. llama3.2:3b (`ollama list` to see)
-  OLLAMA_ENGINE_BASE_URL  default http://localhost:11434/v1
-  OLLAMA_ENGINE_HISTORY   max stored messages per conversation key (default 40)
-  OLLAMA_ENGINE_TIMEOUT   HTTP timeout seconds (default 300 — a cold model
-                          load into RAM can take minutes for big weights)
+  OLLAMA_ENGINE_MODEL      REQUIRED — e.g. llama3.2:3b (`ollama list` to see)
+  OLLAMA_ENGINE_BASE_URL   default http://localhost:11434/v1
+  OLLAMA_ENGINE_HISTORY    max stored messages per conversation key (default 40)
+  OLLAMA_ENGINE_TIMEOUT    HTTP timeout seconds (default 300 — a cold model
+                           load into RAM can take minutes for big weights)
+  OLLAMA_ENGINE_TOOLS      "bash" enables the tool loop (default: off)
+  OLLAMA_ENGINE_MAX_TOOL_TURNS   model↔tool round-trips per turn (default 8)
+  OLLAMA_ENGINE_TOOL_TIMEOUT     per-command seconds (default 60)
 
-State blob: {"v":0,"messages":[...]} — the conversation history. The system
-prompt (persona + channel policy) is NOT stored; it's prepended fresh every
-turn so persona edits apply immediately. Reasoning models that leak
-<think>...</think> into content get it stripped from the reply (and from
-stored history), but the full raw text is emitted as a "thinking" event.
+State blob: {"v":0,"messages":[...]} — user/assistant text only (tool
+traffic is not persisted; it's per-turn scaffolding). The system prompt is
+never stored — rebuilt every turn. Reasoning models that leak
+<think>...</think> into content get it stripped from the reply (raw text
+emitted as a "thinking" event).
 """
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+OUT_CAP = 8000          # chars of command output fed back to the model
 
 
 def die(msg, code=1):
     print(f"engine-ollama: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
 
 
 def _installed_models(base):
@@ -44,6 +65,71 @@ def _installed_models(base):
         return [m.get("name") for m in data.get("models", []) if m.get("name")]
     except Exception:
         return []
+
+
+def _chat(url, model, messages, tools, timeout, base):
+    body = {"model": model, "messages": messages, "stream": False}
+    if tools:
+        body["tools"] = tools
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                url, data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"}),
+            timeout=timeout,
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        if e.code == 404 and "not found" in detail.lower():
+            names = _installed_models(base)
+            detail += f" — installed: {', '.join(names)}" if names else ""
+        die(f"HTTP {e.code} from {url}: {detail}")
+    except Exception as e:
+        die(f"request failed: {e} — is Ollama running? (`ollama serve`, "
+            f"or just `ollama run {model}` once)")
+    try:
+        return data["choices"][0]["message"], data.get("usage") or {}
+    except (KeyError, IndexError, TypeError):
+        die(f"unexpected response shape: {json.dumps(data)[:500]}")
+
+
+def _run_bash(command, cwd, timeout):
+    try:
+        r = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
+                           text=True, timeout=timeout)
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        out = out.strip() or "(no output)"
+        if len(out) > OUT_CAP:
+            out = out[:OUT_CAP] + "\n…(truncated)"
+        return f"exit {r.returncode}\n{out}", r.returncode
+    except subprocess.TimeoutExpired:
+        return f"error: command timed out after {timeout}s", -1
+    except Exception as e:
+        return f"error: {e}", -1
+
+
+BASH_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Run a shell command in the agent's directory and get "
+                       "its output (stdout+stderr, exit code). Use this to "
+                       "read files, run the agent's tools (e.g. tools/vitals, "
+                       "tools/self), and make changes. Never invent output — "
+                       "if you need facts from the system, call this.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string",
+                                       "description": "the shell command"}},
+            "required": ["command"],
+        },
+    },
+}]
 
 
 def main():
@@ -61,6 +147,12 @@ def main():
             + (f" — installed: {', '.join(names)}" if names
                else " (and no Ollama server answered at " + base + ")"))
     url = base.rstrip("/") + "/chat/completions"
+    timeout = float(os.environ.get("OLLAMA_ENGINE_TIMEOUT", "300"))
+
+    tools_mode = os.environ.get("OLLAMA_ENGINE_TOOLS", "").strip() == "bash"
+    max_tool_turns = int(os.environ.get("OLLAMA_ENGINE_MAX_TOOL_TURNS", "8"))
+    tool_timeout = float(os.environ.get("OLLAMA_ENGINE_TOOL_TIMEOUT", "60"))
+    agent_dir = req.get("agent_dir") or "."
 
     history = []
     state = req.get("state")
@@ -72,41 +164,42 @@ def main():
     messages = ([{"role": "system", "content": system}] if system else []) \
         + history + [{"role": "user", "content": req.get("text") or ""}]
 
-    body = json.dumps({"model": model, "messages": messages,
-                       "stream": False}).encode("utf-8")
-    timeout = float(os.environ.get("OLLAMA_ENGINE_TIMEOUT", "300"))
-    try:
-        with urllib.request.urlopen(
-            urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}),
-            timeout=timeout,
-        ) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", "replace")[:500]
-        except Exception:
-            pass
-        if e.code == 404 and "not found" in detail.lower():
-            names = _installed_models(base)
-            detail += f" — installed: {', '.join(names)}" if names else ""
-        die(f"HTTP {e.code} from {url}: {detail}")
-    except Exception as e:
-        die(f"request failed: {e} — is Ollama running? (`ollama serve`, "
-            f"or just `ollama run {model}` once)")
-
-    try:
-        raw = (data["choices"][0]["message"]["content"] or "").strip()
-    except (KeyError, IndexError, TypeError):
-        die(f"unexpected response shape: {json.dumps(data)[:500]}")
+    raw = ""
+    for i in range(max_tool_turns + 1):
+        # last lap: withhold the tool so the model must answer in text
+        offer = BASH_TOOL if (tools_mode and i < max_tool_turns) else None
+        msg, usage = _chat(url, model, messages, offer, timeout, base)
+        if usage:
+            emit({"type": "usage", "model": model, **{
+                k: usage[k] for k in ("prompt_tokens", "completion_tokens")
+                if k in usage}})
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            raw = (msg.get("content") or "").strip()
+            break
+        messages.append(msg)
+        for call in calls:
+            fn = (call.get("function") or {})
+            try:
+                cmd = json.loads(fn.get("arguments") or "{}").get("command", "")
+            except ValueError:
+                cmd = ""
+            if fn.get("name") != "bash" or not cmd:
+                result = "error: only the bash tool exists; pass {\"command\": …}"
+                code = -1
+            else:
+                result, code = _run_bash(cmd, agent_dir, tool_timeout)
+            emit({"type": "tool", "command": cmd, "exit": code})
+            messages.append({"role": "tool",
+                             "tool_call_id": call.get("id") or "call_0",
+                             "content": result})
 
     # Reasoning models (qwen3*, deepseek-r1*) leak <think>…</think> into content.
     text = re.sub(r"^\s*<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
     if text != raw:
-        print(json.dumps({"type": "thinking", "text": raw}))
+        emit({"type": "thinking", "text": raw})
     if not text:
-        die("empty completion (model produced only thinking?)")
+        die("empty completion (model produced only thinking or only tool calls)")
 
     cap = int(os.environ.get("OLLAMA_ENGINE_HISTORY", "40"))
     new_history = (history + [
@@ -114,12 +207,8 @@ def main():
         {"role": "assistant", "content": text},
     ])[-cap:]
 
-    usage = data.get("usage") or {}
-    if usage:
-        print(json.dumps({"type": "usage", "model": model, **{
-            k: usage[k] for k in ("prompt_tokens", "completion_tokens") if k in usage}}))
-    print(json.dumps({"type": "result", "text": text,
-                      "state": {"v": 0, "messages": new_history}}))
+    emit({"type": "result", "text": text,
+          "state": {"v": 0, "messages": new_history}})
 
 
 if __name__ == "__main__":

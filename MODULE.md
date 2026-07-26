@@ -10,12 +10,21 @@ Selected explicitly — `ENGINE=engine-ollama` in `.env`, or per call:
 `run_turn(..., engine="engine-ollama")` / `adapters/run.py --engine
 engine-ollama`. Installing it activates nothing.
 
-It is a **chat engine**: no tools, no file access, no cwd. The kernel
-enforces the edges (claude-only options hard-error; self-modification stays
-on the claude engine). Conversation state is the message history, stored by
-the kernel per `remember=` key (`.memory/<key>@engine-ollama.state`).
+By default it is a **chat engine**: no tools, no file access, no cwd. The
+kernel enforces the edges (claude-only options hard-error; self-modification
+stays on the claude engine). Conversation state is the message history,
+stored by the kernel per `remember=` key (`.memory/<key>@engine-ollama.state`).
 Reasoning models that leak `<think>…</think>` into their reply get it
 stripped (emitted as a `thinking` event instead of polluting history).
+
+**Tools mode** (`OLLAMA_ENGINE_TOOLS=bash`): the model gets exactly one
+tool — run a shell command in the agent dir — in an OpenAI-function-calling
+loop (`OLLAMA_ENGINE_MAX_TOOL_TURNS`, default 8; per-command
+`OLLAMA_ENGINE_TOOL_TIMEOUT`, default 60s; output capped at 8k chars; the
+last lap withholds the tool to force a text answer). This is a real agent
+loop on a local model — which is the experiment: what's the smallest model
+that actually works? Tool traffic is per-turn scaffolding, never persisted
+to state.
 
 ## What it needs
 
@@ -42,7 +51,12 @@ tools/engine-check engine-ollama       # protocol v0 conformance battery
 
 ## What can go wrong
 
-- **No tools means confidently wrong self-reports.** The model can't read
+- **Tools mode is a shell in the hands of whatever model you picked.** A
+  small model *will* eventually run something dumb. The brain's guard hook
+  does NOT protect these turns (Claude Code hooks are claude-engine-only),
+  and there is no permission prompt. Supervised experiments in a disposable
+  clone only — never wire an unattended adapter to tools mode.
+- **In chat mode, no tools means confidently wrong self-reports.** The model can't read
   the repo or run `tools/vitals`; if asked about itself it answers from the
   persona text alone — or hallucinates. That's partly the point (it's the
   baseline claude is compared against), but never route body-work here.
