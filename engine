@@ -39,8 +39,10 @@ emitted as a "thinking" event).
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -67,31 +69,69 @@ def _installed_models(base):
         return []
 
 
+def _server_up(base):
+    root = re.sub(r"/v1/?$", "", base.rstrip("/"))
+    try:
+        urllib.request.urlopen(root + "/api/tags", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_server(base):
+    """Local-first must self-heal: if the base is THIS machine and dead but
+    the ollama binary exists, start `ollama serve` and wait briefly. A remote
+    base is never touched; any failure falls through to the normal error."""
+    if ("localhost" not in base and "127.0.0.1" not in base) \
+            or _server_up(base) or not shutil.which("ollama"):
+        return
+    print("engine-ollama: local server was down — starting `ollama serve`…",
+          file=sys.stderr)
+    try:
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return
+    for _ in range(30):
+        time.sleep(0.5)
+        if _server_up(base):
+            return
+
+
 def _chat(url, model, messages, tools, timeout, base):
     body = {"model": model, "messages": messages, "stream": False}
     if tools:
         body["tools"] = tools
-    try:
-        with urllib.request.urlopen(
-            urllib.request.Request(
-                url, data=json.dumps(body).encode("utf-8"),
-                headers={"Content-Type": "application/json"}),
-            timeout=timeout,
-        ) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = ""
+    local = "localhost" in url or "127.0.0.1" in url
+    data = None
+    for attempt in (0, 1):
         try:
-            detail = e.read().decode("utf-8", "replace")[:500]
-        except Exception:
-            pass
-        if e.code == 404 and "not found" in detail.lower():
-            names = _installed_models(base)
-            detail += f" — installed: {', '.join(names)}" if names else ""
-        die(f"HTTP {e.code} from {url}: {detail}")
-    except Exception as e:
-        die(f"request failed: {e} — is Ollama running? (`ollama serve`, "
-            f"or just `ollama run {model}` once)")
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    url, data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}),
+                timeout=timeout,
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            if e.code == 404 and "not found" in detail.lower():
+                names = _installed_models(base)
+                detail += f" — installed: {', '.join(names)}" if names else ""
+            die(f"HTTP {e.code} from {url}: {detail}")
+        except Exception as e:
+            # a freshly-started local server can drop the very first request
+            if attempt == 0 and local:
+                _ensure_server(base)
+                time.sleep(1.5)
+                continue
+            die(f"request failed: {e} — is Ollama running? (`ollama serve`, "
+                f"or just `ollama run {model}` once)")
     try:
         return data["choices"][0]["message"], data.get("usage") or {}
     except (KeyError, IndexError, TypeError):
@@ -148,6 +188,7 @@ def main():
                else " (and no Ollama server answered at " + base + ")"))
     url = base.rstrip("/") + "/chat/completions"
     timeout = float(os.environ.get("OLLAMA_ENGINE_TIMEOUT", "300"))
+    _ensure_server(base)
 
     # self-awareness: anything we spawn (tools mode) can see which model is
     # actually thinking — tools/vitals reads this instead of guessing
